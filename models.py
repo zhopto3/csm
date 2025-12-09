@@ -136,6 +136,7 @@ class Model(
         input_pos: torch.Tensor,
         temperature: float,
         topk: int,
+        return_logits: bool = False
     ) -> torch.Tensor:
         """
         Args:
@@ -155,11 +156,15 @@ class Model(
         embeds = self._embed_tokens(tokens)
         masked_embeds = embeds * tokens_mask.unsqueeze(-1)
         h = masked_embeds.sum(dim=2)
+
         h = self.backbone(h, input_pos=input_pos, mask=curr_backbone_mask).to(dtype=dtype)
 
         last_h = h[:, -1, :]
         c0_logits = self.codebook0_head(last_h)
         c0_sample = sample_topk(c0_logits, topk, temperature)
+        if return_logits:
+            c0_samp_long = c0_sample.long()
+            c0_sample_logit = c0_logits.gather(-1, c0_samp_long)  
         c0_embed = self._embed_audio(0, c0_sample)
 
         curr_h = torch.cat([last_h.unsqueeze(1), c0_embed], dim=1)
@@ -180,7 +185,8 @@ class Model(
             curr_h = ci_embed
             curr_sample = torch.cat([curr_sample, ci_sample], dim=1)
             curr_pos = curr_pos[:, -1:] + 1
-
+        if return_logits:
+            return curr_sample, c0_sample_logit
         return curr_sample
 
     def reset_caches(self):

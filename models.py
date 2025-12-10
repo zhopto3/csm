@@ -164,7 +164,11 @@ class Model(
         c0_sample = sample_topk(c0_logits, topk, temperature)
         if return_logits:
             c0_samp_long = c0_sample.long()
-            c0_sample_logit = c0_logits.gather(-1, c0_samp_long)  
+            # Convert logits to log probabilities
+            c0_log_probs = torch.log_softmax(c0_logits, dim=-1)
+            # Get log prob of the sampled token
+            c0_sample_log_prob = c0_log_probs.gather(-1, c0_samp_long)
+
         c0_embed = self._embed_audio(0, c0_sample)
 
         curr_h = torch.cat([last_h.unsqueeze(1), c0_embed], dim=1)
@@ -186,7 +190,7 @@ class Model(
             curr_sample = torch.cat([curr_sample, ci_sample], dim=1)
             curr_pos = curr_pos[:, -1:] + 1
         if return_logits:
-            return curr_sample, c0_sample_logit
+            return curr_sample, c0_sample_log_prob
         return curr_sample
 
     def reset_caches(self):

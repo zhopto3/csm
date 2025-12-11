@@ -180,192 +180,213 @@ class Generator:
             return result[0][0], result[1][0]
         return result[0]
 
-@torch.inference_mode()
-def generate_batch(
-    self,
-    texts: List[str],
-    speakers: List[int] = None,
-    contexts: List[List[Segment]] = None,
-    max_audio_length_ms: float = 90_000,
-    temperature: float = 1.0,
-    topk: int = 50,
-    output_logits: bool = False
-    ) :
-    """
-    Generate audio for multiple inputs in parallel.
-    
-    Args:
-        texts: List of text strings to generate
-        speakers: List of speaker IDs
-        contexts: List of context segments for each generation
-        max_audio_length_ms: Maximum audio length in milliseconds
-        temperature: Sampling temperature
-        topk: Top-k sampling parameter
-        output_logits: Whether to return log probabilities
+    @torch.inference_mode()
+    def generate_batch(
+        self,
+        texts: List[str],
+        speakers: List[int] = None,
+        contexts: List[List[Segment]] = None,
+        max_audio_length_ms: float = 90_000,
+        temperature: float = 1.0,
+        topk: int = 50,
+        output_logits: bool = False
+        ) :
+        """
+        Generate audio for multiple inputs in parallel.
         
-    Returns:
-        If output_logits=False: List of generated audio tensors
-        If output_logits=True: Tuple of (audio_outputs, log_prob_results)
-            where log_prob_results is a list of dicts containing:
-                - 'total_log_prob': sum of log probs across all frames
-                - 'avg_log_prob': average log prob per frame
-                - 'num_frames': number of generated frames
-                - 'log_probs': list of per-frame log probs (optional)
-    """
-    batch_size = len(texts)
+        Args:
+            texts: List of text strings to generate
+            speakers: List of speaker IDs
+            contexts: List of context segments for each generation
+            max_audio_length_ms: Maximum audio length in milliseconds
+            temperature: Sampling temperature
+            topk: Top-k sampling parameter
+            output_logits: Whether to return log probabilities
+            
+        Returns:
+            If output_logits=False: List of generated audio tensors
+            If output_logits=True: Tuple of (audio_outputs, log_prob_results)
+                where log_prob_results is a list of dicts containing:
+                    - 'total_log_prob': sum of log probs across all frames
+                    - 'avg_log_prob': average log prob per frame
+                    - 'num_frames': number of generated frames
+                    - 'log_probs': list of per-frame log probs (optional)
+        """
+        batch_size = len(texts)
 
-    # Set defaults if not provided
-    if speakers is None:
-        speakers = [0] * batch_size  # Default to speaker 0 for all
-    if contexts is None:
-        contexts = [[]] * batch_size  # Empty context for all
+        # Set defaults if not provided
+        if speakers is None:
+            speakers = [0] * batch_size  # Default to speaker 0 for all
+        if contexts is None:
+            contexts = [[]] * batch_size  # Empty context for all
+            
+        assert batch_size <= self.max_batch_size, f"Batch size {batch_size} exceeds max {self.max_batch_size}"
+        assert len(speakers) == batch_size and len(contexts) == batch_size
+        # resize KV caches to the actual batch size
+        if not self._model.backbone.caches_are_enabled():
+            self._model.setup_caches(batch_size)
+        self._model.reset_caches()
+
+        max_generation_len = int(max_audio_length_ms / 80)
+        max_seq_len = 2048
+        max_context_len = max_seq_len - max_generation_len
+
+        # Prepare batched prompts
+        prompt_tokens, prompt_tokens_mask, prompt_lengths = self._prepare_batch_prompts(
+            texts, speakers, contexts
+        )
         
-    assert batch_size <= self.max_batch_size, f"Batch size {batch_size} exceeds max {self.max_batch_size}"
-    assert len(speakers) == batch_size and len(contexts) == batch_size
-    # resize KV caches to the actual batch size
-    if not self._model.backbone.caches_are_enabled():
-        self._model.setup_caches(batch_size)
-    self._model.reset_caches()
+        if prompt_tokens.size(1) >= max_context_len:
+            raise ValueError(
+                f"Inputs too long, must be below max_seq_len - max_generation_len: {max_context_len}"
+            )
 
-    max_generation_len = int(max_audio_length_ms / 80)
-    max_seq_len = 2048
-    max_context_len = max_seq_len - max_generation_len
+        # Track which sequences are still generating
+        is_generating = torch.ones(batch_size, dtype=torch.bool, device=self.device)
+        
+        # Store samples for each batch item
+        batch_samples = [[] for _ in range(batch_size)]
+        batch_log_probs = [[] for _ in range(batch_size)] if output_logits else None
+        
+        curr_tokens = prompt_tokens
+        curr_tokens_mask = prompt_tokens_mask
+        curr_pos = torch.arange(0, prompt_tokens.size(1), device=self.device).unsqueeze(0).repeat(batch_size, 1)
 
-    # Prepare batched prompts
-    prompt_tokens, prompt_tokens_mask, prompt_lengths = self._prepare_batch_prompts(
-        texts, speakers, contexts
-    )
-    
-    if prompt_tokens.size(1) >= max_context_len:
-        raise ValueError(
-            f"Inputs too long, must be below max_seq_len - max_generation_len: {max_context_len}"
-        )
-
-    # Track which sequences are still generating
-    is_generating = torch.ones(batch_size, dtype=torch.bool, device=self.device)
-    
-    # Store samples for each batch item
-    batch_samples = [[] for _ in range(batch_size)]
-    batch_log_probs = [[] for _ in range(batch_size)] if output_logits else None
-    
-    curr_tokens = prompt_tokens
-    curr_tokens_mask = prompt_tokens_mask
-    curr_pos = torch.arange(0, prompt_tokens.size(1), device=self.device).unsqueeze(0).repeat(batch_size, 1)
-
-    # Process the prompt first
-    if output_logits:
-        samples, log_probs = self._model.generate_frame(
-            curr_tokens, curr_tokens_mask, curr_pos, temperature, topk, return_logits=True
-        )
-    else:
-        samples = self._model.generate_frame(
-            curr_tokens, curr_tokens_mask, curr_pos, temperature, topk
-        )
-    
-    # Check if prompt generation already hit EOS
-    for i in range(batch_size):
-        if torch.all(samples[i] == 0):
-            is_generating[i] = False
-        else:
-            batch_samples[i].append(samples[i])
-            if output_logits:
-                # log_probs should be (batch_size, num_codebooks) or (batch_size, num_codebooks, 1)
-                # Sum across codebooks to get total log prob for this frame
-                frame_log_prob = log_probs[i].sum().item()
-                batch_log_probs[i].append(frame_log_prob)
-    
-    # Now set up for autoregressive generation (1 token at a time)
-    next_frame = torch.zeros(batch_size, 1, 33, dtype=torch.long, device=self.device)
-    next_frame[:, 0, :-1] = samples
-    next_frame_mask = torch.zeros(batch_size, 1, 33, dtype=torch.bool, device=self.device)
-    next_frame_mask[:, 0, :-1] = True
-    
-    curr_tokens = next_frame
-    curr_tokens_mask = next_frame_mask
-    curr_pos = curr_pos[:, -1:] + 1
-
-    for step in range(max_generation_len - 1):
+        # Process the prompt first
         if output_logits:
             samples, log_probs = self._model.generate_frame(
                 curr_tokens, curr_tokens_mask, curr_pos, temperature, topk, return_logits=True
             )
-            # Store log probs for sequences still generating
-            for i in range(batch_size):
-                if is_generating[i]:
-                    frame_log_prob = log_probs[i].sum().item()
-                    batch_log_probs[i].append(frame_log_prob)
         else:
             samples = self._model.generate_frame(
                 curr_tokens, curr_tokens_mask, curr_pos, temperature, topk
             )
         
-        # Check for EOS (all zeros) and store samples
+        # Check if prompt generation already hit EOS
         for i in range(batch_size):
-            if is_generating[i]:
-                if torch.all(samples[i] == 0):
-                    is_generating[i] = False
-                else:
-                    batch_samples[i].append(samples[i])
+            if torch.all(samples[i] == 0):
+                is_generating[i] = False
+            else:
+                batch_samples[i].append(samples[i])
+                if output_logits:
+                    # log_probs should be (batch_size, num_codebooks) or (batch_size, num_codebooks, 1)
+                    # Sum across codebooks to get total log prob for this frame
+                    frame_log_prob = log_probs[i].sum().item()
+                    batch_log_probs[i].append(frame_log_prob)
         
-        # If all sequences are done, break
-        if not is_generating.any():
-            break
-
-        # Prepare next step - only for sequences still generating
-        # We still need to process all batch items to maintain cache consistency
-        # samples is (batch_size, num_codebooks=32), we need (batch_size, 1, 33)
+        # Now set up for autoregressive generation (1 token at a time)
         next_frame = torch.zeros(batch_size, 1, 33, dtype=torch.long, device=self.device)
-        next_frame[:, 0, :-1] = samples  # audio tokens in first 32 positions
-        # position 32 (index -1) stays 0 for text token
-        
+        next_frame[:, 0, :-1] = samples
         next_frame_mask = torch.zeros(batch_size, 1, 33, dtype=torch.bool, device=self.device)
-        next_frame_mask[:, 0, :-1] = True  # mask for audio tokens
+        next_frame_mask[:, 0, :-1] = True
         
         curr_tokens = next_frame
         curr_tokens_mask = next_frame_mask
         curr_pos = curr_pos[:, -1:] + 1
 
-    # Decode audio for each batch item
-    audio_outputs = []
-    for i, samples in enumerate(batch_samples):
-        if len(samples) == 0:
-            # Empty generation - create silent audio
-            audio = torch.zeros(1, device=self.device)
-        else:
-            # Stack samples and decode
-            stacked_samples = torch.stack(samples)  # (num_frames, num_codebooks)
-            audio = self._audio_tokenizer.decode(
-                stacked_samples.unsqueeze(0).permute(0, 2, 1)
-            ).squeeze(0).squeeze(0)
+        for step in range(max_generation_len - 1):
+            if output_logits:
+                samples, log_probs = self._model.generate_frame(
+                    curr_tokens, curr_tokens_mask, curr_pos, temperature, topk, return_logits=True
+                )
+                # Store log probs for sequences still generating
+                for i in range(batch_size):
+                    if is_generating[i]:
+                        frame_log_prob = log_probs[i].sum().item()
+                        batch_log_probs[i].append(frame_log_prob)
+            else:
+                samples = self._model.generate_frame(
+                    curr_tokens, curr_tokens_mask, curr_pos, temperature, topk
+                )
             
-            # Apply watermark
-            audio, wm_sample_rate = watermark(
-                self._watermarker, audio, self.sample_rate, CSM_1B_GH_WATERMARK
-            )
-            audio = torchaudio.functional.resample(
-                audio, orig_freq=wm_sample_rate, new_freq=self.sample_rate
-            )
+            # Check for EOS (all zeros) and store samples
+            for i in range(batch_size):
+                if is_generating[i]:
+                    if torch.all(samples[i] == 0):
+                        is_generating[i] = False
+                    else:
+                        batch_samples[i].append(samples[i])
+            
+            # If all sequences are done, break
+            if not is_generating.any():
+                break
+
+            # Prepare next step - only for sequences still generating
+            # We still need to process all batch items to maintain cache consistency
+            # samples is (batch_size, num_codebooks=32), we need (batch_size, 1, 33)
+            next_frame = torch.zeros(batch_size, 1, 33, dtype=torch.long, device=self.device)
+            next_frame[:, 0, :-1] = samples  # audio tokens in first 32 positions
+            # position 32 (index -1) stays 0 for text token
+            
+            next_frame_mask = torch.zeros(batch_size, 1, 33, dtype=torch.bool, device=self.device)
+            next_frame_mask[:, 0, :-1] = True  # mask for audio tokens
+            
+            curr_tokens = next_frame
+            curr_tokens_mask = next_frame_mask
+            curr_pos = curr_pos[:, -1:] + 1
         
-        audio_outputs.append(audio)
+        max_frames = max(len(samples) for samples in batch_samples)
+        
+        if max_frames == 0:
+            # All generations were empty
+            audio_outputs = [torch.zeros(1, device=self.device) for _ in range(batch_size)]
+        else:
+            # Prepare batched tensor for decoder
+            # Shape: (batch_size, num_codebooks, num_frames)
+            batched_samples = torch.zeros(
+                batch_size, 32, max_frames, dtype=torch.long, device=self.device
+            )
+            sample_lengths = []
+            
+            for i, samples in enumerate(batch_samples):
+                if len(samples) > 0:
+                    stacked = torch.stack(samples)  # (num_frames, num_codebooks)
+                    batched_samples[i, :, :len(samples)] = stacked.T
+                    sample_lengths.append(len(samples))
+                else:
+                    sample_lengths.append(0)
+            
+            # Decode entire batch at once
+            batched_audio = self._audio_tokenizer.decode(batched_samples)  # (batch_size, 1, audio_samples)
+            
+            # Process each audio output (trim padding and apply watermark)
+            audio_outputs = []
+            for i in range(batch_size):
+                if sample_lengths[i] == 0:
+                    audio = torch.zeros(1, device=self.device)
+                else:
+                    # Trim to actual length (80ms per frame = sample_rate * 0.08 samples per frame)
+                    expected_samples = int(sample_lengths[i] * self.sample_rate * 0.08)
+                    audio = batched_audio[i, 0, :expected_samples]
+                    
+                    # Apply watermark
+                    audio, wm_sample_rate = watermark(
+                        self._watermarker, audio, self.sample_rate, CSM_1B_GH_WATERMARK
+                    )
+                    audio = torchaudio.functional.resample(
+                        audio, orig_freq=wm_sample_rate, new_freq=self.sample_rate
+                    )
+                
+                audio_outputs.append(audio)
 
-    if output_logits:
-        # Compile log probability statistics for each sequence
-        log_prob_results = []
-        for i in range(batch_size):
-            total_log_prob = sum(batch_log_probs[i])
-            num_frames = len(batch_log_probs[i])
-            log_prob_results.append({
-                'total_log_prob': total_log_prob,
-                'avg_log_prob': total_log_prob / max(num_frames, 1),
-                'num_frames': num_frames,
-                'frame_log_probs': batch_log_probs[i]  # Optional: keep per-frame for debugging
-            })
-        return audio_outputs, log_prob_results
-    
-    return audio_outputs
+        if output_logits:
+            # Compile log probability statistics for each sequence
+            log_prob_results = []
+            for i in range(batch_size):
+                total_log_prob = sum(batch_log_probs[i])
+                num_frames = len(batch_log_probs[i])
+                log_prob_results.append({
+                    'total_log_prob': total_log_prob,
+                    'avg_log_prob': total_log_prob / max(num_frames, 1),
+                    'num_frames': num_frames,
+                    'frame_log_probs': batch_log_probs[i]  # Optional: keep per-frame for debugging
+                })
+            return audio_outputs, log_prob_results
+        
+        return audio_outputs
 
 
-def load_csm_1b(device: str = "cuda", max_batch_size=64) -> Generator:
+def load_csm_1b(device: str = "cuda", max_batch_size=64):
     model = Model.from_pretrained("sesame/csm-1b")
     model.to(device=device, dtype=torch.bfloat16)
 

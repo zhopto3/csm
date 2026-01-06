@@ -1,4 +1,4 @@
-"""Run sampling from csm with efficient batching."""
+"""Run sampling from csm with efficient batching and resume capability."""
 import argparse
 import os
 import torch
@@ -12,42 +12,78 @@ def chunk_list(lst, chunk_size):
         yield lst[i:i + chunk_size]
 
 
+def get_existing_samples(out_dir_wav, item):
+    """Check which samples already exist."""
+    existing = set()
+    item_dir = f'{out_dir_wav}/{item}'
+    
+    if not os.path.exists(item_dir):
+        return existing
+    
+    for filename in os.listdir(item_dir):
+        if filename.endswith('.wav'):
+            # Parse format: "00_n00000.wav" -> (0, 0)
+            basename = filename.replace('.wav', '')
+            parts = basename.split('_n')
+            if len(parts) == 2:
+                try:
+                    line_idx = int(parts[0])
+                    sample_idx = int(parts[1])
+                    existing.add((line_idx, sample_idx))
+                except ValueError:
+                    continue
+    
+    return existing
+
+
 def main(input_file, batch_size, samples_per_text, out_dir_wav, out_dir_probs):
     if torch.cuda.is_available():
         device = "cuda"
     else:
         device = "cpu"
     
-    # Load generator with max batch size
-    generator = load_csm_1b(device, max_batch_size=batch_size)
-    sr = generator.sample_rate
-    resampler = torchaudio.transforms.Resample(
-    orig_freq=sr, 
-    new_freq=16000
-        ).to(device)
-    
     item = input_file.split('/')[-1].split('.')[0]
     print(f"Processing: {item}")
-    
-    os.makedirs(f'{out_dir_wav}/{item}', exist_ok=True)
     
     # Read all lines first
     with open(input_file, 'r', encoding='utf-8') as f:
         lines = [line.strip() for line in f if line.strip()]
     
-    print(f"Total lines to process: {len(lines)}")
-    print(f"Samples per text: {samples_per_text}")
-    print(f"Total audio files to generate: {len(lines) * samples_per_text}")
+    # Check existing samples
+    existing_samples = get_existing_samples(out_dir_wav, item)
+    print(f"Found {len(existing_samples)} existing samples")
     
-    # Prepare all jobs (line_idx, sample_idx, text)
+    # Prepare jobs only for missing samples
     jobs = []
     for line_idx, text in enumerate(lines):
         for sample_idx in range(samples_per_text):
-            jobs.append((line_idx, sample_idx, text))
+            if (line_idx, sample_idx) not in existing_samples:
+                jobs.append((line_idx, sample_idx, text))
+    
+    if not jobs:
+        print(f"All {len(lines) * samples_per_text} samples already exist. Skipping.")
+        return
+    
+    print(f"Total lines: {len(lines)}")
+    print(f"Samples per text: {samples_per_text}")
+    print(f"Total expected: {len(lines) * samples_per_text}")
+    print(f"Missing samples to generate: {len(jobs)}")
+    
+    # Load generator only if needed
+    generator = load_csm_1b(device, max_batch_size=batch_size)
+    sr = generator.sample_rate
+    resampler = torchaudio.transforms.Resample(
+        orig_freq=sr, 
+        new_freq=16000
+    ).to(device)
+    
+    os.makedirs(f'{out_dir_wav}/{item}', exist_ok=True)
+    os.makedirs(out_dir_probs, exist_ok=True)
     
     print(f"Processing in batches of {batch_size}")
     
-    with open(f'{out_dir_probs}/{item}.csv', 'w', encoding='utf-8') as prob_out:
+    # Append to existing prob file
+    with open(f'{out_dir_probs}/{item}.csv', 'a', encoding='utf-8') as prob_out:
         
         # Process in batches
         for batch_idx, job_batch in enumerate(chunk_list(jobs, batch_size)):
@@ -56,7 +92,6 @@ def main(input_file, batch_size, samples_per_text, out_dir_wav, out_dir_probs):
             
             # Pad batch if needed
             if actual_batch_size < batch_size:
-                print(f"Last batch: padding {actual_batch_size} -> {batch_size}")
                 batch_texts = batch_texts + [batch_texts[0]] * (batch_size - actual_batch_size)
             
             # Generate audio
@@ -92,7 +127,7 @@ def main(input_file, batch_size, samples_per_text, out_dir_wav, out_dir_probs):
                 progress = ((batch_idx + 1) * batch_size) / len(jobs) * 100
                 print(f"Processed {batch_idx + 1} batches ({progress:.1f}%)")
     
-    print(f"Done---Generated {len(jobs)} audio files.")
+    print(f"Done---Generated {len(jobs)} new audio files.")
 
 
 if __name__ == "__main__":

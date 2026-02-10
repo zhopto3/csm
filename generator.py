@@ -83,8 +83,8 @@ class Generator:
         audio = audio.to(self.device)
         audio_tokens = self._audio_tokenizer.encode(audio.unsqueeze(0).unsqueeze(0))[0]
         # add EOS frame
-        eos_frame = torch.zeros(audio_tokens.size(0), 1).to(self.device)
-        audio_tokens = torch.cat([audio_tokens, eos_frame], dim=1)
+        # eos_frame = torch.zeros(audio_tokens.size(0), 1).to(self.device)
+        # audio_tokens = torch.cat([audio_tokens, eos_frame], dim=1)
 
         audio_frame = torch.zeros(audio_tokens.size(1), 33).long().to(self.device)
         audio_frame_mask = torch.zeros(audio_tokens.size(1), 33).bool().to(self.device)
@@ -385,6 +385,129 @@ class Generator:
         
         return audio_outputs
 
+    @torch.inference_mode()
+    def compute_audio_logprob_batch(
+        self,
+        target_audios: List[torch.Tensor],
+        texts: List[str],
+        speakers: List[int] = None,
+        contexts: List[List[Segment]] = None,
+    ) -> List[dict]:
+        """
+        Compute the log probability of target audios given text and context (batched).
+        Only uses the 0th codebook.
+        """
+        batch_size = len(target_audios)
+        
+        if speakers is None:
+            speakers = [0] * batch_size
+        if contexts is None:
+            contexts = [[]] * batch_size
+        
+        assert batch_size <= self.max_batch_size
+        
+        # Tokenize all target audios
+        all_target_tokens = []
+        for audio in target_audios:
+            tokens, _ = self._tokenize_audio(audio.to(self.device))
+            all_target_tokens.append(tokens)
+        
+        max_frames = max(tokens.size(0) for tokens in all_target_tokens)
+        
+        # Prepare the prompts
+        prompt_tokens, prompt_tokens_mask, prompt_lengths = self._prepare_batch_prompts(
+            texts=texts,
+            speakers=speakers,
+            contexts=contexts
+        )
+        
+        # Reset caches
+        if not self._model.backbone.caches_are_enabled():
+            self._model.setup_caches(batch_size)
+        self._model.reset_caches()
+        
+        curr_pos = torch.arange(0, prompt_tokens.size(1), device=self.device).unsqueeze(0).repeat(batch_size, 1)
+        
+        # Track log probs
+        batch_frame_log_probs = [[] for _ in range(batch_size)]
+        num_frames_per_item = [tokens.size(0) for tokens in all_target_tokens]
+        is_active = torch.ones(batch_size, dtype=torch.bool, device=self.device)
+        
+        # Process prompt first using generate_frame to get logits
+        c0_logits = self._model.generate_frame(
+            prompt_tokens, prompt_tokens_mask, curr_pos, 
+            temperature=1.0, topk=50, return_logits=False, return_raw_logits=True
+        )#[1]  # Returns (samples, logits), we want logits
+        
+        # Get log probs for first frame
+        log_probs = torch.log_softmax(c0_logits, dim=-1)  # (batch_size, vocab_size)
+        
+        for i in range(batch_size):
+            if 0 < num_frames_per_item[i]:
+                gt_code = all_target_tokens[i][0, 0].item()  # First frame, 0th codebook
+                frame_log_prob = log_probs[i, gt_code].item()
+                batch_frame_log_probs[i].append(frame_log_prob)
+        
+        # Prepare next tokens with ground truth
+        next_frame = torch.zeros(batch_size, 1, 33, dtype=torch.long, device=self.device)
+        next_frame_mask = torch.zeros(batch_size, 1, 33, dtype=torch.bool, device=self.device)
+        
+        for i in range(batch_size):
+            if 0 < num_frames_per_item[i]:
+                next_frame[i, 0, :-1] = all_target_tokens[i][0, :-1]
+                next_frame_mask[i, 0, :-1] = True
+        
+        curr_tokens = next_frame
+        curr_tokens_mask = next_frame_mask
+        curr_pos = curr_pos[:, -1:] + 1
+        
+        # Autoregressively process remaining frames
+        for frame_idx in range(1, max_frames):
+            # Get logits using generate_frame
+            c0_logits = self._model.generate_frame(
+                curr_tokens, curr_tokens_mask, curr_pos,
+                temperature=1.0, topk=50, return_logits=False, return_raw_logits=True
+            )#[1]
+            
+            log_probs = torch.log_softmax(c0_logits, dim=-1)
+            
+            # Get log prob of ground truth for this frame
+            for i in range(batch_size):
+                if frame_idx < num_frames_per_item[i]:
+                    gt_code = all_target_tokens[i][frame_idx, 0].item()  # 0th codebook
+                    frame_log_prob = log_probs[i, gt_code].item()
+                    batch_frame_log_probs[i].append(frame_log_prob)
+                else:
+                    is_active[i] = False
+            
+            if not is_active.any():
+                break
+            
+            # Prepare next frame with ground truth
+            next_frame = torch.zeros(batch_size, 1, 33, dtype=torch.long, device=self.device)
+            next_frame_mask = torch.zeros(batch_size, 1, 33, dtype=torch.bool, device=self.device)
+            
+            for i in range(batch_size):
+                if frame_idx < num_frames_per_item[i]:
+                    next_frame[i, 0, :-1] = all_target_tokens[i][frame_idx, :-1]
+                    next_frame_mask[i, 0, :-1] = True
+            
+            curr_tokens = next_frame
+            curr_tokens_mask = next_frame_mask
+            curr_pos = curr_pos[:, -1:] + 1
+        
+        # Compile results
+        results = []
+        for i in range(batch_size):
+            total_log_prob = sum(batch_frame_log_probs[i])
+            results.append({
+                'total_log_prob': total_log_prob,
+                'avg_log_prob': total_log_prob / max(len(batch_frame_log_probs[i]), 1),
+                'num_frames': len(batch_frame_log_probs[i]),
+                'frame_log_probs': batch_frame_log_probs[i]
+            })
+        
+        return results
 
 def load_csm_1b(device: str = "cuda", max_batch_size=64):
     model = Model.from_pretrained("sesame/csm-1b")

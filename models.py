@@ -136,7 +136,8 @@ class Model(
         input_pos: torch.Tensor,
         temperature: float,
         topk: int,
-        return_logits: bool = False
+        return_logits: bool = False,
+        return_raw_logits: bool = False
     ) -> torch.Tensor:
         """
         Args:
@@ -161,6 +162,8 @@ class Model(
 
         last_h = h[:, -1, :]
         c0_logits = self.codebook0_head(last_h)
+        if return_raw_logits:
+            return c0_logits
         c0_sample = sample_topk(c0_logits, topk, temperature)
         if return_logits:
             c0_samp_long = c0_sample.long()
